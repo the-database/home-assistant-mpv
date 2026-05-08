@@ -9,6 +9,14 @@ from typing import Any
 
 _logger = logging.getLogger(__package__)
 
+# Heartbeat: ping mpv with a cheap get_property every N seconds and
+# force-disconnect if the response doesn't arrive within the timeout.
+# Without this a half-open TCP socket (mpv killed, network glitch) leaves
+# the integration stuck "connected" forever, since StreamReader.readline
+# never returns when no EOF/RST has been received.
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_TIMEOUT = 10
+
 ConnectionEventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 PropertyCallback = Callable[[str, Any], Awaitable[None]]
@@ -25,6 +33,7 @@ class MPVConnection:
     _request_futures: dict[int, asyncio.Future[dict[str, Any]]]
     _reader: asyncio.StreamReader | None
     _writer: asyncio.StreamWriter | None
+    _heartbeat_task: asyncio.Task | None
 
     def __init__(self):
         self._event_callbacks = []
@@ -32,6 +41,7 @@ class MPVConnection:
 
         self._reader = None
         self._writer = None
+        self._heartbeat_task = None
 
     def is_connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing()
@@ -55,9 +65,13 @@ class MPVConnection:
         self._reader_task = asyncio.create_task(self._reader_fn())
         self._request_id = 1
         self._request_futures = {}
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_fn())
 
     async def disconnect(self) -> None:
         _logger.info('Disconnecting')
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         self._reader_task.cancel()
         self._writer.close()
         await self._writer.wait_closed()
@@ -67,6 +81,14 @@ class MPVConnection:
 
     def _handle_connection_failure(self, exception: Exception | None = None) -> None:
         _logger.error('Connection to mpv broken', exc_info=exception)
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
         self._reader = None
         self._writer = None
         self._run_event_handlers('disconnected', {})
@@ -97,6 +119,35 @@ class MPVConnection:
             elif 'event' in response:
                 event = response.pop('event')
                 self._run_event_handlers(event, response)
+
+    async def _heartbeat_fn(self) -> None:
+        """Periodically ping mpv; force-disconnect if it stops responding.
+
+        Without this, a half-open TCP socket (mpv killed, network drop)
+        keeps readline() blocked forever and the integration believes
+        it's still connected. By issuing a get_property with a short
+        timeout we get a positive liveness signal -- if it fails we
+        trigger the same connection-failure path used elsewhere, which
+        dispatches the 'disconnected' event so media_player.py's
+        reconnect loop runs.
+        """
+        try:
+            while self.is_connected():
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                if not self.is_connected():
+                    return
+                try:
+                    await asyncio.wait_for(
+                        self.command('get_property', 'idle-active', response=True),
+                        timeout=HEARTBEAT_TIMEOUT,
+                    )
+                except (asyncio.TimeoutError, MPVConnectionException) as ex:
+                    _logger.warning('mpv heartbeat failed (%s); forcing reconnect', ex)
+                    self._reader_task.cancel()
+                    self._handle_connection_failure(ex)
+                    return
+        except asyncio.CancelledError:
+            return
 
     def add_event_callback(self, callback: ConnectionEventCallback) -> None:
         self._event_callbacks.append(callback)
