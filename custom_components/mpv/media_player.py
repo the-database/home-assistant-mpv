@@ -170,6 +170,20 @@ class MpvEntity(MediaPlayerEntity):
             await self._mpv.watch_property(MPVProperty.LOOP_FILE, self._on_loop_change)
             await self._mpv.watch_property(MPVProperty.LOOP_PLAYLIST, self._on_loop_change)
 
+            # Settle: wait briefly to confirm the connection is actually
+            # stable before marking the entity available. When the bridge is
+            # in an "accept TCP then immediately drop" state (mpv's pipe is
+            # dead while the bridge process is up), connect_ip + the
+            # watch_property calls all succeed in milliseconds, then the
+            # reader sees TCP EOF and disconnect_handler fires. Without this
+            # settle the entity briefly flips to available, the dashboard
+            # conditional opens, the Now-Playing block renders, then it all
+            # vanishes -- producing visible flicker every 2s during a
+            # reconnect-loop while mpv is closed.
+            await asyncio.sleep(0.5)
+            if not self._connection.is_connected():
+                return  # disconnect_handler will handle the reconnect
+
             self._attr_available = True
             self._attr_changed()
 
