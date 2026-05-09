@@ -80,6 +80,14 @@ class MPVConnection:
         self._writer = None
 
     def _handle_connection_failure(self, exception: Exception | None = None) -> None:
+        # Idempotent: command() may call us when its drain() errors, and the
+        # heartbeat's exception handler may then call us again on the same
+        # MPVConnectionException. Without this guard we double-fire the
+        # 'disconnected' event, the integration spins up two parallel
+        # reconnect handlers, and on every cascading failure the count
+        # doubles -- exhausting file descriptors and crashing HA.
+        if self._writer is None and self._reader is None:
+            return
         _logger.error('Connection to mpv broken', exc_info=exception)
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
