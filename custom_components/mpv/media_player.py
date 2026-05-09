@@ -139,7 +139,13 @@ class MpvEntity(MediaPlayerEntity):
                     log_level = logging.WARNING if attempt == 1 else logging.DEBUG
                     _logger.log(log_level, 'Failed to establish connection to mpv', exc_info=ex)
 
-                    await asyncio.sleep(2 ** min(attempt, 4) * 5)
+                    # Flat 5s retry instead of upstream's 10/20/40/80 backoff:
+                    # the LAN bridge connect is cheap, and an 80s wait between
+                    # attempts means up to 80s of "mpv is back but the
+                    # integration hasn't noticed yet" UX -- unacceptable for an
+                    # interactive dashboard where you want control as soon as
+                    # you start playing.
+                    await asyncio.sleep(5)
 
             self._mpv = MPV(self._connection)
             await self._mpv.add_event_listener(MPVEvent.DISCONNECTED, disconnect_handler)
