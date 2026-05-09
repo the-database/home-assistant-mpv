@@ -121,6 +121,13 @@ class MpvEntity(MediaPlayerEntity):
             self._attr_available = False
             self.schedule_update_ha_state()
 
+            # Debounce: prevent a flap-storm when the bridge accepts a TCP
+            # connection but immediately drops it (mpv pipe dead while the
+            # bridge process is up). Without this, connect_ip succeeds, the
+            # entity goes "playing", reader sees EOF a few ms later, this
+            # handler fires, and we loop at TCP-roundtrip speed -- ~50/sec.
+            await asyncio.sleep(2)
+
             await self._connect()  # automatically try to reconnect
 
         async def connect_handler():
@@ -168,6 +175,13 @@ class MpvEntity(MediaPlayerEntity):
 
             self._connect_task = None
 
+        # Re-entry gate: if a connect_handler is already in flight, leave
+        # it alone. Otherwise concurrent disconnect events (which arrive
+        # during a flap cascade) each create their own task; each succeeds,
+        # overwrites self._connection, and fires its own subsequent
+        # disconnect event -- the cascade compounds.
+        if self._connect_task is not None and not self._connect_task.done():
+            return
         self._connect_task = asyncio.create_task(connect_handler())
 
     async def _disconnect(self):
