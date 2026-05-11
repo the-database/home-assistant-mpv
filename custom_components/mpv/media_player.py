@@ -130,64 +130,88 @@ class MpvEntity(MediaPlayerEntity):
 
             await self._connect()  # automatically try to reconnect
 
+        async def delayed_reconnect():
+            await asyncio.sleep(5)
+            await self._connect()
+
         async def connect_handler():
-            attempt = 0
-            self._connection = MPVConnection()
-            while not self._connection.is_connected():
-                attempt += 1
-                try:
-                    if self._host and self._port:
-                        await self._connection.connect_ip(self._host, self._port)
-                    elif self._socket:
-                        await self._connection.connect_unix(self._socket)
-                    else:
-                        raise RuntimeError('Invalid configuration')
-                except MPVConnectionException as ex:
-                    log_level = logging.WARNING if attempt == 1 else logging.DEBUG
-                    _logger.log(log_level, 'Failed to establish connection to mpv', exc_info=ex)
+            success = False
+            try:
+                attempt = 0
+                self._connection = MPVConnection()
+                while not self._connection.is_connected():
+                    attempt += 1
+                    try:
+                        if self._host and self._port:
+                            await self._connection.connect_ip(self._host, self._port)
+                        elif self._socket:
+                            await self._connection.connect_unix(self._socket)
+                        else:
+                            raise RuntimeError('Invalid configuration')
+                    except MPVConnectionException as ex:
+                        log_level = logging.WARNING if attempt == 1 else logging.DEBUG
+                        _logger.log(log_level, 'Failed to establish connection to mpv', exc_info=ex)
 
-                    # Flat 5s retry instead of upstream's 10/20/40/80 backoff:
-                    # the LAN bridge connect is cheap, and an 80s wait between
-                    # attempts means up to 80s of "mpv is back but the
-                    # integration hasn't noticed yet" UX -- unacceptable for an
-                    # interactive dashboard where you want control as soon as
-                    # you start playing.
-                    await asyncio.sleep(5)
+                        # Flat 5s retry instead of upstream's 10/20/40/80 backoff:
+                        # the LAN bridge connect is cheap, and an 80s wait between
+                        # attempts means up to 80s of "mpv is back but the
+                        # integration hasn't noticed yet" UX -- unacceptable for an
+                        # interactive dashboard where you want control as soon as
+                        # you start playing.
+                        await asyncio.sleep(5)
 
-            self._mpv = MPV(self._connection)
-            await self._mpv.add_event_listener(MPVEvent.DISCONNECTED, disconnect_handler)
+                self._mpv = MPV(self._connection)
+                await self._mpv.add_event_listener(MPVEvent.DISCONNECTED, disconnect_handler)
 
-            await self._mpv.watch_property(MPVProperty.IDLE, self._refresh_state)
-            await self._mpv.watch_property(MPVProperty.PAUSED, self._refresh_state)
-            await self._mpv.watch_property(MPVProperty.BUFFERING, self._refresh_state)
+                await self._mpv.watch_property(MPVProperty.IDLE, self._refresh_state)
+                await self._mpv.watch_property(MPVProperty.PAUSED, self._refresh_state)
+                await self._mpv.watch_property(MPVProperty.BUFFERING, self._refresh_state)
 
-            await self._mpv.watch_property(MPVProperty.MUTE, self._on_mute_change)
-            await self._mpv.watch_property(MPVProperty.VOLUME, self._on_volume_change)
+                await self._mpv.watch_property(MPVProperty.MUTE, self._on_mute_change)
+                await self._mpv.watch_property(MPVProperty.VOLUME, self._on_volume_change)
 
-            await self._mpv.watch_property(MPVProperty.DURATION, self._on_duration_change)
-            await self._mpv.watch_property(MPVProperty.TITLE, self._on_title_change)
+                await self._mpv.watch_property(MPVProperty.DURATION, self._on_duration_change)
+                await self._mpv.watch_property(MPVProperty.TITLE, self._on_title_change)
 
-            await self._mpv.watch_property(MPVProperty.LOOP_FILE, self._on_loop_change)
-            await self._mpv.watch_property(MPVProperty.LOOP_PLAYLIST, self._on_loop_change)
+                await self._mpv.watch_property(MPVProperty.LOOP_FILE, self._on_loop_change)
+                await self._mpv.watch_property(MPVProperty.LOOP_PLAYLIST, self._on_loop_change)
 
-            # Settle: wait briefly to confirm the connection is actually
-            # stable before marking the entity available. When the bridge is
-            # in an "accept TCP then immediately drop" state (mpv's pipe is
-            # dead while the bridge process is up), connect_ip + the
-            # watch_property calls all succeed in milliseconds, then the
-            # reader sees TCP EOF and disconnect_handler fires. Without this
-            # settle the entity briefly flips to available, the dashboard
-            # conditional opens, the Now-Playing block renders, then it all
-            # vanishes -- producing visible flicker every 2s during a
-            # reconnect-loop while mpv is closed.
-            await asyncio.sleep(0.5)
-            if not self._connection.is_connected():
-                return  # disconnect_handler will handle the reconnect
+                # Settle: wait briefly to confirm the connection is actually
+                # stable before marking the entity available. When the bridge is
+                # in an "accept TCP then immediately drop" state (mpv's pipe is
+                # dead while the bridge process is up), connect_ip + the
+                # watch_property calls all succeed in milliseconds, then the
+                # reader sees TCP EOF and disconnect_handler fires. Without this
+                # settle the entity briefly flips to available, the dashboard
+                # conditional opens, the Now-Playing block renders, then it all
+                # vanishes -- producing visible flicker every 2s during a
+                # reconnect-loop while mpv is closed.
+                await asyncio.sleep(0.5)
+                if not self._connection.is_connected():
+                    return  # safety-net retry below will handle it
 
-            self._attr_available = True
-            self._attr_changed()
-
-            self._connect_task = None
+                self._attr_available = True
+                self._attr_changed()
+                success = True
+            except asyncio.CancelledError:
+                # _disconnect() cancels this task during entity teardown.
+                # Treat cancellation as "do not retry" so we don't fight the
+                # platform unload.
+                success = True
+                raise
+            except Exception:
+                _logger.exception('connect_handler aborted unexpectedly; will retry in 5s')
+            finally:
+                self._connect_task = None
+                # Safety net: if we exited without marking the entity available,
+                # schedule a fresh attempt. Without this the reconnect chain can
+                # silently die if disconnect_handler doesn't fire (e.g. the
+                # reader_task is cancelled before _handle_connection_failure
+                # dispatches its event, or an unhandled exception escapes the
+                # handler) and the entity stays unavailable forever even though
+                # mpv is back. Saw this in practice after a network flap.
+                if not success:
+                    asyncio.create_task(delayed_reconnect())
 
         # Re-entry gate: if a connect_handler is already in flight, leave
         # it alone. Otherwise concurrent disconnect events (which arrive
